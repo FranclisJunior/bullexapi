@@ -2,6 +2,7 @@
 from bullexapi.api import BullexAPI
 import bullexapi.constants as OP_code
 import bullexapi.country_id as Country
+import os
 import threading
 import time
 import json
@@ -78,6 +79,17 @@ class Bullex:
         self.SESSION_HEADER = header
         self.SESSION_COOKIE = cookie
 
+    def _wait_until(self, predicate, timeout=10, poll_interval=0.05):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                if predicate():
+                    return True
+            except Exception:
+                pass
+            time.sleep(poll_interval)
+        return False
+
     def connect(self, sms_code=None):
         try:
             self.api.close()
@@ -101,6 +113,7 @@ class Bullex:
         self.api.set_session(headers=self.SESSION_HEADER,
                              cookies=self.SESSION_COOKIE)
 
+        global_value.balance_id = None
         check, reason = self.api.connect()
 
         if check == True:
@@ -108,8 +121,13 @@ class Bullex:
             self.re_subscribe_stream()
 
             # ---------for async get name: "position-changed", microserviceName
-            while global_value.balance_id == None:
-                pass
+            if not self._wait_until(lambda: global_value.balance_id is not None, timeout=15):
+                logging.error("connect timeout waiting for balance_id")
+                try:
+                    self.api.close()
+                except Exception:
+                    pass
+                return False, "timeout waiting for balance_id"
 
             self.position_change_all(
                 "subscribeMessage", global_value.balance_id)
@@ -216,17 +234,29 @@ class Bullex:
     def get_instruments(self, type):
         # type="crypto"/"forex"/"cfd"
         time.sleep(self.suspend)
-        self.api.instruments = None
-        while self.api.instruments == None:
+        deadline = time.time() + 20
+        last_error = None
+        while time.time() < deadline:
+            self.api.instruments = None
             try:
+                if not self.check_connect():
+                    check, reason = self.connect()
+                    if not check:
+                        last_error = RuntimeError(f"connect failed: {reason}")
+                        time.sleep(1)
+                        continue
                 self.api.get_instruments(type)
-                start = time.time()
-                while self.api.instruments == None and time.time() - start < 10:
-                    pass
-            except:
-                logging.error('**error** api.get_instruments need reconnect')
-                self.connect()
-        return self.api.instruments
+                if self._wait_until(lambda: self.api.instruments is not None, timeout=10):
+                    return self.api.instruments
+                last_error = TimeoutError(f"timeout waiting for instruments({type})")
+            except Exception as exc:
+                last_error = exc
+            logging.error('**error** api.get_instruments need reconnect')
+            check, reason = self.connect()
+            if not check:
+                last_error = RuntimeError(f"connect failed: {reason}")
+            time.sleep(1)
+        raise TimeoutError(f"get_instruments timeout for {type}: {last_error}")
 
     def instruments_input_to_ACTIVES(self, type):
         instruments = self.get_instruments(type)
@@ -312,7 +342,13 @@ class Bullex:
 
     def __get_digital_open(self):
         # for digital options
-        digital_data = self.get_digital_underlying_list_data()["underlying"]
+        try:
+            data = self.get_digital_underlying_list_data()
+            if not data or "underlying" not in data:
+                return
+            digital_data = data["underlying"]
+        except Exception:
+            return
         for digital in digital_data:
             name = digital["underlying"]
             schedule = digital["schedule"]
@@ -519,23 +555,34 @@ class Bullex:
     # ________________________self.api.getcandles() wss________________________
 
     def get_candles(self, ACTIVES, interval, count, endtime):
-        self.api.candles.candles_data = None
-        while True:
+        deadline = time.time() + 20
+        last_error = None
+        while time.time() < deadline:
             try:
                 if ACTIVES not in OP_code.ACTIVES:
                     print('Asset {} not found on consts'.format(ACTIVES))
-                    break
+                    return None
+                if not self.check_connect():
+                    check, reason = self.connect()
+                    if not check:
+                        last_error = RuntimeError(f"connect failed: {reason}")
+                        time.sleep(1)
+                        continue
+                self.api.candles.candles_data = None
                 self.api.getcandles(
                     OP_code.ACTIVES[ACTIVES], interval, count, endtime)
-                while self.check_connect and self.api.candles.candles_data == None:
-                    pass
-                if self.api.candles.candles_data != None:
-                    break
-            except:
+                if self._wait_until(lambda: self.api.candles.candles_data is not None, timeout=10):
+                    return self.api.candles.candles_data
+                last_error = TimeoutError(f"timeout waiting for candles({ACTIVES})")
+            except Exception as exc:
+                last_error = exc
                 logging.error('**error** get_candles need reconnect')
-                self.connect()
+            check, reason = self.connect()
+            if not check:
+                last_error = RuntimeError(f"connect failed: {reason}")
+            time.sleep(1)
 
-        return self.api.candles.candles_data
+        raise TimeoutError(f"get_candles timeout for {ACTIVES}: {last_error}")
 
     #######################################################
     # ______________________________________________________
@@ -1076,7 +1123,7 @@ class Bullex:
 
         request_id = self.api.place_digital_option(instrument_id, amount)
 
-        while self.api.digital_option_placed_id.get(request_id) == None:
+        while self.api.digital_option_placed_id.get(request_id) is None:
             pass
         digital_order_id = self.api.digital_option_placed_id.get(request_id)
         if isinstance(digital_order_id, int):
@@ -1217,9 +1264,11 @@ class Bullex:
                     return data["msg"]["position"]["pnl_realized"] - data["msg"]["position"]["buy_amount"]
 
     def check_win_digital_v2(self, buy_order_id):
-
+        deadline = time.time() + 120  # aguarda até 2 min pelo fechamento
         while self.get_async_order(buy_order_id)["position-changed"] == {}:
-            pass
+            if time.time() > deadline:
+                return False, None
+            time.sleep(0.5)
         order_data = self.get_async_order(
             buy_order_id)["position-changed"]["msg"]
         if order_data != None:
@@ -1601,16 +1650,57 @@ class Bullex:
             exp = time.mktime(now_date.timetuple())
 
         date_formated = str(datetime.utcfromtimestamp(exp).strftime("%Y%m%d%H%M"))
-        active_id = str(OP_code.ACTIVES[active])
-        instrument_id = "do" + active_id + "A" + \
-            date_formated[:8] + "D" + date_formated[8:] + \
-            "00T" + str(duration) + "M" + action + "SPT"
+        active_base = active.split("-")[0]  # ex: 'GBPUSD-op' → 'GBPUSD'
+        suffix = active.split("-")[1].upper() if "-" in active else None
+        # Resolve o asset_id via assets.json do repositório ob-trade
+        raw_id = None
+        _assets_candidates = [
+            os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "bot", "assets.json"),
+            os.path.expanduser("~/Documents/workspace/ob-trade/bot/assets.json"),
+        ]
+        for _path in _assets_candidates:
+            _path = os.path.normpath(_path)
+            if os.path.isfile(_path):
+                try:
+                    with open(_path, encoding="utf-8") as _f:
+                        _map = json.load(_f)
+                    if active_base in _map:
+                        entry = _map[active_base]
+                        if suffix == "OTC":
+                            did = entry.get("digital_otc_id")
+                            if did == 0:
+                                # Confirmado inválido — não tentar
+                                return False, f"digital OTC confirmado inválido para {active_base}"
+                            elif did is not None:
+                                # ID confirmado funcionando
+                                raw_id = did
+                            else:
+                                # Desconhecido — tenta com OTC ID (correto para pairs OTC digitais)
+                                raw_id = entry.get("OTC")
+                        elif suffix == "OP":
+                            raw_id = entry.get("op")
+                        else:
+                            raw_id = entry.get("base")
+                except Exception:
+                    pass
+                break
+        if raw_id is None:
+            # Fallback para constants da biblioteca (apenas pairs -op ou sem sufixo)
+            raw_id = OP_code.ACTIVES.get(active, OP_code.ACTIVES.get(active_base, 0))
+        active_id = str(raw_id)
+        # Formato v2: do{ID}A{YYYYMMDD}D{HHMM}00T{DUR}M{TYPE}SPT
+        instrument_id = ("do" + active_id + "A" +
+                         date_formated[:8] + "D" + date_formated[8:] +
+                         "00T" + str(duration) + "M" + action + "SPT")
         logger = logging.getLogger(__name__)
-        logger.info(instrument_id)
+        logger.info(f"instrument_id={instrument_id} asset_id={active_id} (active={active})")
         request_id = self.api.place_digital_option_v2(instrument_id, active_id, amount)
 
+        deadline = time.time() + 15
         while self.api.digital_option_placed_id.get(request_id) is None:
-            pass
+            if time.time() > deadline:
+                return False, "timeout: sem resposta do servidor"
+            time.sleep(0.1)
 
         digital_order_id = self.api.digital_option_placed_id.get(request_id)
         if isinstance(digital_order_id, int):
